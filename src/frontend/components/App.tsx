@@ -5,7 +5,7 @@
 import * as React from "react";
 import { Id64String, OpenMode } from "@bentley/bentleyjs-core";
 import { AccessToken, ConnectClient, IModelQuery, Project, Config } from "@bentley/imodeljs-clients";
-import { IModelApp, IModelConnection, FrontendRequestContext, AuthorizedFrontendRequestContext } from "@bentley/imodeljs-frontend";
+import { IModelApp, IModelConnection, FrontendRequestContext, AuthorizedFrontendRequestContext, Viewport, EmphasizeElements, FeatureSymbology, StandardViewId } from "@bentley/imodeljs-frontend";
 import { Presentation, SelectionChangeEventArgs, ISelectionProvider } from "@bentley/presentation-frontend";
 import { Button, ButtonSize, ButtonType, Spinner, SpinnerSize } from "@bentley/ui-core";
 import { SignIn } from "@bentley/ui-components";
@@ -14,8 +14,11 @@ import PropertiesWidget from "./Properties";
 import GridWidget from "./Table";
 import TreeWidget from "./Tree";
 import ViewportContentControl from "./Viewport";
+import * as querystring from "querystring";
+import * as url from "url";
 import "@bentley/icons-generic-webfont/dist/bentley-icons-generic-webfont.css";
 import "./App.css";
+import { ColorDef, RenderMode } from "@bentley/imodeljs-common";
 
 // tslint:disable: no-console
 // cSpell:ignore imodels
@@ -34,6 +37,8 @@ export interface AppState {
 /** A component the renders the whole application UI */
 export default class App extends React.Component<{}, AppState> {
 
+  private _urlParams: any;
+
   /** Creates an App instance */
   constructor(props?: any, context?: any) {
     super(props, context);
@@ -44,6 +49,7 @@ export default class App extends React.Component<{}, AppState> {
       },
       offlineIModel: false,
     };
+    this._urlParams = this._getUrlParams();
   }
 
   public componentDidMount() {
@@ -106,6 +112,53 @@ export default class App extends React.Component<{}, AppState> {
     this.setState((prev) => ({ user: { ...prev.user, accessToken, isLoading: false } }));
   }
 
+  private _getUrlParams() {
+    const query = url.parse(document.URL).query;
+    return query ? querystring.parse(query.toString()) : {};
+  }
+
+  private _getElementsIds() {
+    return this._urlParams.elementIds ? this._urlParams.elementIds.split(" ") : [];
+  }
+
+  private _getElementColor() {
+    return this._urlParams.elementColor ? "#" + this._urlParams.elementColor : undefined;
+  }
+
+  private _isWireFrameOn() {
+    return this._urlParams.wireFrame ? this._urlParams.wireFrame === "true" : undefined;
+  }
+
+  private _isIsolateOn() {
+    return this._urlParams.isolate ? this._urlParams.isolate === "true" : undefined;
+  }
+
+  private _isTopViewOn() {
+    return this._urlParams.topView ? this._urlParams.topView === "true" : undefined;
+  }
+
+  private _focusAndZoom(elements: any[], vp: Viewport, elementColor?: string) {
+    const emphasize = EmphasizeElements.getOrCreate(vp);
+
+    vp.zoomToElements(elements);
+    if (this._isIsolateOn())  // either isolate or emphasize elements
+      emphasize.isolateElements(elements, vp, true);
+    else {
+      emphasize.emphasizeElements(elements, vp, FeatureSymbology.Appearance.fromTransparency(0.95));
+      if (!elementColor) vp.iModel.hilited.setHilite(elements, true); // select elements only if no color is passed in
+    }
+    if (elementColor) emphasize.overrideElements(elements, vp, new ColorDef(elementColor)); // color elements
+  }
+
+  // get URL param values and execute corresponding functions.
+  private _processUrlParams(vp: Viewport) {
+    const elementIds = this._getElementsIds();
+    const elementColor = this._getElementColor();
+    if (elementIds.length > 0) this._focusAndZoom(elementIds, vp, elementColor);
+    if (this._isTopViewOn()) vp.setStandardRotation(StandardViewId.Top);
+    if (this._isWireFrameOn()) vp.viewFlags.renderMode = RenderMode.Wireframe;
+  }
+
   /** Pick the first available spatial view definition in the imodel */
   private async getFirstViewDefinitionId(imodel: IModelConnection): Promise<Id64String> {
     const viewSpecs = await imodel.views.queryProps({});
@@ -139,6 +192,9 @@ export default class App extends React.Component<{}, AppState> {
       // attempt to get a view definition
       const viewDefinitionId = imodel ? await this.getFirstViewDefinitionId(imodel) : undefined;
       this.setState({ imodel, viewDefinitionId });
+
+      // once iModel has loaded, add one time listener to process URL params when view opens.
+      IModelApp.viewManager.onViewOpen.addOnce( (vp: Viewport) => this._processUrlParams(vp));
     } catch (e) {
       // if failed, close the imodel and reset the state
       if (this.state.offlineIModel) {
@@ -168,7 +224,7 @@ export default class App extends React.Component<{}, AppState> {
       ui = (<SignIn onSignIn={this._onStartSignin} onRegister={this._onRegister} onOffline={this._onOffline} />);
     } else if (!this.state.imodel || !this.state.viewDefinitionId) {
       // if we don't have an imodel / view definition id - render a button that initiates imodel open
-      ui = (<OpenIModelButton accessToken={this.state.user.accessToken} offlineIModel={this.state.offlineIModel} onIModelSelected={this._onIModelSelected} />);
+      ui = (<OpenIModelButton accessToken={this.state.user.accessToken} offlineIModel={this.state.offlineIModel} onIModelSelected={this._onIModelSelected} urlParams={this._urlParams} />);
     } else {
       // if we do have an imodel and view definition id - render imodel components
       ui = (<IModelComponents imodel={this.state.imodel} viewDefinitionId={this.state.viewDefinitionId} />);
@@ -191,6 +247,7 @@ interface OpenIModelButtonProps {
   accessToken: AccessToken | undefined;
   offlineIModel: boolean;
   onIModelSelected: (imodel: IModelConnection | undefined) => void;
+  urlParams: any;
 }
 /** React state for [[OpenIModelButton]] component */
 interface OpenIModelButtonState {
@@ -202,8 +259,12 @@ class OpenIModelButton extends React.PureComponent<OpenIModelButtonProps, OpenIM
 
   /** Finds project and imodel ids using their names */
   private async getIModelInfo(): Promise<{ projectId: string, imodelId: string }> {
-    const projectName = Config.App.get("imjs_test_project");
-    const imodelName = Config.App.get("imjs_test_imodel");
+    // get project and iModel name from URL params.
+    const projectName = this.props.urlParams.projectName;
+    const imodelName = this.props.urlParams.imodelName;
+
+    if (!projectName || !imodelName)
+      throw new Error("projectName or imodelName missing. \n\n 😱😱😱");
 
     const requestContext: AuthorizedFrontendRequestContext = await AuthorizedFrontendRequestContext.create();
 
